@@ -810,26 +810,6 @@
       "success": true
     }
   },
-
-  
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-  
   {
     "name": "SHL",
     "hint": "Bitwise shift left, 1 << 1 = 2",

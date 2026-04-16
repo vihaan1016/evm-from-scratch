@@ -8,8 +8,32 @@ pub struct EvmResult {
 pub fn evm(_code: impl AsRef<[u8]>) -> EvmResult {
     let mut stack: Vec<U256> = Vec::new();
     let mut pc = 0;
-
+    // Give EVM memory
+    let mut memory: Vec<u8> = Vec::new();
     let code = _code.as_ref();
+
+    // List of safe JUMPDEST
+    let mut valid_jump_dest = std::collections::HashSet::new();
+    let mut i = 0;
+    while i < code.len() {
+        let opcode = code[i];
+        if opcode == 0x5b {
+            // this means that we have found a valid jumpdest
+            valid_jump_dest.insert(i);
+            i += 1;
+        } else if opcode >= 0x60 && opcode <= 0x7f { 
+            // the size to jump is the PUSH size of the PUSH opcode
+            let size = (opcode - 0x5f) as usize;
+            // We have to do +1 because we also want to skip the byte of the PUSH opcode itself
+            i += size + 1; 
+        } else {
+            // All the other opcodes are 1 byte only
+            i += 1;
+        }
+    }
+
+
+
 
     while pc < code.len() {
         let opcode = code[pc];
@@ -480,27 +504,162 @@ pub fn evm(_code: impl AsRef<[u8]>) -> EvmResult {
 
                 let is_negative = (value_array[31] & 0x80) != 0;
 
+                // if the shift is massive
                 if shift >= U256::from(256) {
                     if is_negative {
-                        stack.push(U256::MAX);
+                        stack.push(U256::MAX); // a negative number when shifted to infinity is just 1s
                     } else {
-                        stack.push(U256::zero());
+                        stack.push(U256::zero()); // a positive number shifted to infinity is just 0s
                     }
-                } else {
+                } else { // if the shift is small
                     let shift_usize = shift.as_usize();
                     let mut result = value >> shift_usize;
                     
+                    // if the number is negative then we just do a simple masking operation
                     if is_negative && shift_usize > 0 {
+                        // if it was an 8 bit number then this operation would look like
+                        // 1111 1111 shift by like 5 positions then 1110 0000
+                        // the mask would then work perfectly
                         let mask = U256::MAX << (256 - shift_usize);
                         result = result | mask; 
                     }
-                    
                     stack.push(result);
                 }
             }
+
+            // BYTE
+            0x1a => {
+                // get the index and the number from stack
+                let i = stack.pop().unwrap();
+                let x = stack.pop().unwrap();
+
+                let i_uszie = i.as_usize();
+                let mut array_x = [0u8; 32];
+                
+                // in this OPCODE the index starts from most significant to least significant
+                x.to_big_endian(&mut array_x);
+
+                // if the index exceeds the 32 byte number that exist in evm then jsut push 0
+                if i >= U256::from(32)  {
+                    stack.push(U256::zero());
+                } else {
+                    // get the target byte convert to U256 and push on stack
+                    let target_byte = array_x[i_uszie];
+                    let result = U256::from(target_byte);
+                    stack.push(result);
+                }
+            },
             
+            // DUP ALL
+            0x80..=0x8f => {
+                let n: usize = ((opcode - 0x80) + 1).into();
+                let target_value_index = stack.len() - n;
+                let target_value = stack[target_value_index];
+                let result = target_value;
+                stack.push(result);
+            },
+
+
+            // SWAP ALL
+            0x90..=0x9f => {
+                // get the top of stack which should be swapped
+                let top = stack.len() - 1;
+                let n: usize = ((opcode - 0x90) + 1).into();
+                // getting the swap index is quite different
+                // because the swap1 fnc works in such a way the first 2 elements are swapped
+                // so the swap index is actually two from the top of the stack
+                // the stack here is ordered differently, 
+                // ie the top of stack is the end of stacck array
+                let swap_index = stack.len() - n - 1;
+                stack.swap(top, swap_index);
+            },
+
+            // PC
+            0x58 => {
+                let mut pc_value = pc;
+                pc_value -= 1;
+                stack.push(U256::from(pc_value));
+            }
+
+            // GAS
+            0x5a => {
+                let  gas = U256::MAX;
+                stack.push(gas);
+            },
+
+            // JUMPDSET
+            0x5b => {
+                // just empty becasuse it lets the loop continue
+            },
+
+            // JUMP
+            0x56 => {
+                let jump_target = stack.pop().unwrap().as_usize();
+                // check if the jump_target is valid jump destination
+                if valid_jump_dest.contains(&jump_target) {
+                    pc = jump_target;
+                } else {
+                    return EvmResult { stack, success: false };
+                }
+
+            },
+            // JUMPI
+            0x57 => {
+                let jump_target = stack.pop().unwrap().as_usize();
+                let condition = stack.pop().unwrap();
+
+                if !condition.is_zero() {
+                    if valid_jump_dest.contains(&jump_target) {
+                        pc = jump_target;
+                    } else {
+                        return EvmResult {stack, success: false};
+                    }
+                }
+            }, 
+
+            // MSTORE
+            0x52 => {
+                let offset = stack.pop().unwrap().as_usize();
+                let value = stack.pop().unwrap();
+                // Calculate memory expansion because it must extend in 32 byte chunks
+                let required_size = offset + 32;
+                let chunks = (required_size + 31) / 32;
+                let target_size = chunks * 32;
+                
+                if memory.len() < target_size {
+                    memory.resize(target_size, 0);
+                }
+                // break U256 into 32 bytes
+                let mut value_bytes = [0u8; 32];
+                value.to_big_endian(&mut value_bytes);
+                // insert the 32 bytes directly into memory array
+                for i in 0..32 {
+                    memory[offset + i] = value_bytes[i];
+                }
+            }
+
+            // MLOAD
+            0x51 => {
+                let offset = stack.pop().unwrap().as_usize();
+
+                let required_size = offset + 32;
+                let chunks = (required_size + 31) / 32;
+                let target_size = chunks * 32;
+                
+                if memory.len() < target_size {
+                    memory.resize(target_size, 0);
+                }
+                let mut data = [0u8; 32];
+                for i in 0..32 {
+                    data[i] = memory[offset + i];
+                }
+                let value = U256::from_big_endian(&data);
+                stack.push(value);
+            },
 
             
+
+
 
 
             _ => return EvmResult {stack, success: false,},
