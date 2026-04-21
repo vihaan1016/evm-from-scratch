@@ -285,7 +285,7 @@ fn main() {
             } else {
                 // Otherwise check every single field
                 for i in 0..expected_logs_parsed.len() {
-                    // Because we added #[derive(PartialEq)] to [Log](cci:2://file:///home/vihaan-jain/evm-from-scratch/rust/src/lib.rs:9:0-13:1) in lib.rs, we can compare them directly!
+                    // Because we added #[derive(PartialEq)] to [Log]
                     if expected_logs_parsed[i] != result.logs[i] {
                         matching = false;
                         break;

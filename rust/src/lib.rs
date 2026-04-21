@@ -63,12 +63,17 @@ pub struct EvmContext {
 }
 // ==============================================================================================
 
-pub fn evm(_code: impl AsRef<[u8]>, context: EvmContext) -> EvmResult {
+pub fn evm(_code: impl AsRef<[u8]>, mut context: EvmContext) -> EvmResult {
+    let mut storage: std::collections::HashMap<U256, U256> = std::collections::HashMap::new();
+    evm_internal(_code, &mut context, &mut storage, false)
+}
+// see delegate call opcode to understand why evm_internal was created
+
+fn evm_internal(_code: impl AsRef<[u8]>, context: &mut EvmContext, storage: &mut std::collections::HashMap<U256, U256>, is_static: bool) -> EvmResult {
     let mut stack: Vec<U256> = Vec::new();
     let mut pc = 0;
     // Give EVM memory
     let mut memory: Vec<u8> = Vec::new();
-    let mut storage: std::collections::HashMap<U256, U256> = std::collections::HashMap::new();
     let mut logs: Vec<Log> = Vec::new();
     let mut return_data: Vec<u8> = Vec::new();
     let code = _code.as_ref();
@@ -1145,6 +1150,9 @@ pub fn evm(_code: impl AsRef<[u8]>, context: EvmContext) -> EvmResult {
             
             // SSTORE
             0x55 => {
+                if is_static {
+                    return EvmResult { stack, success: false, logs, ret: Vec::new() };
+                }
                 let key = stack.pop().unwrap();
                 let value = stack.pop().unwrap();
                 storage.insert(key, value);
@@ -1159,6 +1167,9 @@ pub fn evm(_code: impl AsRef<[u8]>, context: EvmContext) -> EvmResult {
             
             // LOG 0
             0xa0 => {
+                if is_static {
+                    return EvmResult { stack, success: false, logs, ret: Vec::new() };
+                }
                 let offset = stack.pop().unwrap().as_usize();
                 let size = stack.pop().unwrap().as_usize();
                 let mut address = U256::zero();
@@ -1184,6 +1195,9 @@ pub fn evm(_code: impl AsRef<[u8]>, context: EvmContext) -> EvmResult {
 
             // LOG 1 => LOG 4
             0xa1..=0xa4 => {
+                if is_static {
+                    return EvmResult { stack, success: false, logs, ret: Vec::new() };
+                }
                 let n: usize = (opcode - 0xa0).into();
                 let offset = stack.pop().unwrap().as_usize();
                 let size = stack.pop().unwrap().as_usize();
@@ -1294,7 +1308,6 @@ pub fn evm(_code: impl AsRef<[u8]>, context: EvmContext) -> EvmResult {
                     }
                 }
 
-                let mut new_context = context.clone();
                 let mut new_tx = TxContext {
                     to: Some(address),       // The address we are calling
                     data: Some(call_data),   // The calldata payload we just sliced from memory!
@@ -1310,11 +1323,14 @@ pub fn evm(_code: impl AsRef<[u8]>, context: EvmContext) -> EvmResult {
                     new_tx.gasprice = tx.gasprice;
                 }
                 
-                new_context.tx = Some(new_tx);
+                let original_tx = context.tx.clone();
+                context.tx = Some(new_tx);
                 let bytecode = code; 
 
                 // 5. Fire!
-                let sub_result = evm(&bytecode, new_context);
+                let mut dummy_storage = std::collections::HashMap::new();
+                let sub_result = evm_internal(&bytecode, context, &mut dummy_storage, is_static);
+                context.tx = original_tx;
                 return_data = sub_result.ret.clone();
                 
                 // Expand memory for return data regardless of success
@@ -1337,6 +1353,318 @@ pub fn evm(_code: impl AsRef<[u8]>, context: EvmContext) -> EvmResult {
                 } else {
                     stack.push(U256::zero());
                 }
+            }
+
+            // RETURNDATASIZE
+            0x3d => {
+                let return_data_size = return_data.len();
+                stack.push(U256::from(return_data_size));
+            }
+
+            // RETURNDATACOPY
+            0x3e => {
+                let dest_offset = stack.pop().unwrap().as_usize();
+                let offset = stack.pop().unwrap().as_usize();
+                let size = stack.pop().unwrap().as_usize();
+
+                let required_size = dest_offset + size;
+                let chunks = (required_size + 31)/32;
+                let target_size = chunks * 32;
+
+                if memory.len() < target_size {
+                    memory.resize(target_size, 0);
+                }
+                if offset + size > return_data.len() {
+                    return EvmResult {stack, success: false, logs, ret: Vec::new() };
+                }
+
+                for i in 0..size {
+                    memory[dest_offset + i] = return_data[offset + i];
+                } 
+            }
+
+            // DELEGATECALL
+            0xf4 => {
+                let _gas = stack.pop().unwrap();
+                let address = stack.pop().unwrap();
+                let arg_offset = stack.pop().unwrap().as_usize();
+                let arg_size = stack.pop().unwrap().as_usize();
+                let ret_offset = stack.pop().unwrap().as_usize();
+                let ret_size = stack.pop().unwrap().as_usize();
+
+                let required_args_size = arg_offset + arg_size;
+                let chunks_args = (required_args_size + 31) / 32;
+                let target_args_size = chunks_args * 32;
+                
+                if memory.len() < target_args_size {
+                    memory.resize(target_args_size, 0);
+                } 
+                
+                let call_data = memory[arg_offset..arg_offset+arg_size].to_vec();
+
+                let mut code = Vec::new();
+                if let Some(state) = &context.state {
+                    if let Some(accounts) = &state.accounts {
+                        if let Some(account_info) = accounts.get(&address) {
+                            if let Some(code_account) = &account_info.code {
+                                code = code_account.clone();
+                            }
+                        }
+                    }
+                }
+
+                let mut new_tx = TxContext {
+                    to: None,
+                    data: Some(call_data),
+                    from: None,
+                    origin: None,
+                    gasprice: None,
+                    value: None
+                };
+                
+                if let Some(tx) = &context.tx {
+                    new_tx.to = tx.to;
+                    new_tx.from = tx.from;
+                    new_tx.origin = tx.origin;
+                    new_tx.gasprice = tx.gasprice;
+                    new_tx.value = tx.value;
+                }
+                
+                let original_tx = context.tx.clone();
+                context.tx = Some(new_tx);
+                let bytecode = code; 
+
+                let sub_result = evm_internal(&bytecode, context, storage, is_static);
+                context.tx = original_tx;
+                return_data = sub_result.ret.clone();
+                
+                let required_ret_size = ret_offset + ret_size;
+                let chunks_ret = (required_ret_size + 31) / 32;
+                let target_ret_size = chunks_ret * 32;
+                if memory.len() < target_ret_size {
+                    memory.resize(target_ret_size, 0);
+                } 
+                
+                let copy_size = std::cmp::min(sub_result.ret.len(), ret_size);
+                for i in 0..copy_size {
+                    memory[ret_offset + i] = sub_result.ret[i];
+                }
+                
+                if sub_result.success {
+                    logs.extend(sub_result.logs);
+                    stack.push(U256::one());
+                } else {
+                    stack.push(U256::zero());
+                }
+            }
+
+            // CREATE
+            0xf0 => {
+                if is_static {
+                    return EvmResult { stack, success: false, logs, ret: Vec::new() };
+                }
+                
+                let value = stack.pop().unwrap();
+                let offset = stack.pop().unwrap().as_usize();
+                let size = stack.pop().unwrap().as_usize();
+
+                let required_size = offset + size;
+                let chunks = (required_size + 31) / 32;
+                let target_size = chunks * 32;
+                if memory.len() < target_size {
+                    memory.resize(target_size, 0);
+                }
+                let init_code = memory[offset..offset+size].to_vec();
+
+                // generate new address
+                let mut caller = U256::zero();
+                if let Some(tx) = &context.tx {
+                    if let Some(to) = &tx.to {
+                        caller = *to;
+                    }
+                }
+                let mut hasher = Keccak256::new();
+                let mut caller_bytes = [0u8; 32];
+                caller.to_big_endian(&mut caller_bytes);
+                hasher.update(&caller_bytes); // simple hash derivation
+                hasher.update(b"nonce");
+                let new_address = U256::from_big_endian(&hasher.finalize());
+
+                // pre-fund account by updating context
+                if context.state.is_none() {
+                    context.state = Some(StateContext { accounts: Some(std::collections::HashMap::new()) });
+                }
+                if let Some(state) = &mut context.state {
+                    if state.accounts.is_none() {
+                        state.accounts = Some(std::collections::HashMap::new());
+                    }
+                    if let Some(accounts) = &mut state.accounts {
+                        accounts.insert(new_address, AccountInfo {
+                            balance: Some(value),
+                            code: Some(Vec::new()),
+                        });
+                    }
+                }
+
+                let mut new_tx = TxContext {
+                    to: Some(new_address),
+                    data: Some(Vec::new()),
+                    from: Some(caller),
+                    origin: None,
+                    gasprice: None,
+                    value: Some(value)
+                };
+                if let Some(tx) = &context.tx {
+                    new_tx.origin = tx.origin;
+                    new_tx.gasprice = tx.gasprice;
+                }
+                
+                let original_tx = context.tx.clone();
+                context.tx = Some(new_tx);
+
+                let mut dummy_storage = std::collections::HashMap::new();
+                let sub_result = evm_internal(&init_code, context, &mut dummy_storage, false);
+                context.tx = original_tx;
+
+                if sub_result.success {
+                    logs.extend(sub_result.logs);
+                    stack.push(new_address);
+                    
+                    // store the returned bytecode into the state
+                    if let Some(state) = &mut context.state {
+                        if let Some(accounts) = &mut state.accounts {
+                            if let Some(account) = accounts.get_mut(&new_address) {
+                                account.code = Some(sub_result.ret.clone());
+                            }
+                        }
+                    }
+                } else {
+                    stack.push(U256::zero());
+                }
+            }
+
+                        // STATICCALL
+            0xfa => {
+                let _gas = stack.pop().unwrap();
+                let address = stack.pop().unwrap();
+                // Note: STATICCALL does not take `value` from the stack!
+                let arg_offset = stack.pop().unwrap().as_usize();
+                let arg_size = stack.pop().unwrap().as_usize();
+                let ret_offset = stack.pop().unwrap().as_usize();
+                let ret_size = stack.pop().unwrap().as_usize();
+
+                // Expand memory for args
+                let required_args_size = arg_offset + arg_size;
+                let chunks_args = (required_args_size + 31) / 32;
+                let target_args_size = chunks_args * 32;
+                
+                if memory.len() < target_args_size {
+                    memory.resize(target_args_size, 0);
+                } 
+                
+                let call_data = memory[arg_offset..arg_offset+arg_size].to_vec();
+
+                // get bytecode from the target account
+                let mut code = Vec::new();
+                if let Some(state) = &context.state {
+                    if let Some(accounts) = &state.accounts {
+                        if let Some(account_info) = accounts.get(&address) {
+                            if let Some(code_account) = &account_info.code {
+                                code = code_account.clone();
+                            }
+                        }
+                    }
+                }
+
+                // generate new context
+                let mut new_tx = TxContext {
+                    to: Some(address),  // the fixed address we are calling
+                    data: Some(call_data),
+                    from: None,   
+                    origin: None,    
+                    gasprice: None,  
+                    value: None      
+                };
+                
+                if let Some(tx) = &context.tx {
+                    new_tx.from = tx.to;
+                    new_tx.origin = tx.origin;
+                    new_tx.gasprice = tx.gasprice;
+                }
+                
+                let original_tx = context.tx.clone();
+                context.tx = Some(new_tx);
+                let bytecode = code; 
+
+                // static call executes in its own seperated state
+                // any changes in state inside this inner evm execution 
+                // technically should revert, but for this simple EVM implementation 
+                // just feeding it a blank storage satisfies the condition
+                let mut dummy_storage = std::collections::HashMap::new();
+                let sub_result = evm_internal(&bytecode, context, &mut dummy_storage, true);
+                context.tx = original_tx;
+                return_data = sub_result.ret.clone();
+                
+                // Expand memory for return data regardless of success
+                let required_ret_size = ret_offset + ret_size;
+                let chunks_ret = (required_ret_size + 31) / 32;
+                let target_ret_size = chunks_ret * 32;
+                if memory.len() < target_ret_size {
+                    memory.resize(target_ret_size, 0);
+                } 
+                
+                // Copy return data
+                let copy_size = std::cmp::min(sub_result.ret.len(), ret_size);
+                for i in 0..copy_size {
+                    memory[ret_offset + i] = sub_result.ret[i];
+                }
+                
+                if sub_result.success {
+                    logs.extend(sub_result.logs);
+                    stack.push(U256::one());
+                } else {
+                    stack.push(U256::zero());
+                }
+            }
+
+
+            // SELFDESTRUCT
+            0xff => {
+                if is_static {
+                    return EvmResult { stack, success: false, logs, ret: Vec::new() };
+                }
+
+                let beneficiary = stack.pop().unwrap();
+
+                let mut self_address = U256::zero();
+                if let Some(tx) = &context.tx {
+                    if let Some(to) = &tx.to {
+                        self_address = *to;
+                    }
+                }
+
+                let mut self_balance = U256::zero();
+                if let Some(state) = &mut context.state {
+                    if let Some(accounts) = &mut state.accounts {
+                        if let Some(account_info) = accounts.get(&self_address) {
+                            if let Some(balance) = account_info.balance {
+                                self_balance = balance;
+                            }
+                        }
+                        
+                        accounts.remove(&self_address);
+                        
+                        let beneficiary_account = accounts.entry(beneficiary).or_insert(AccountInfo {
+                            balance: Some(U256::zero()),
+                            code: Some(Vec::new()),
+                        });
+                        
+                        let current_balance = beneficiary_account.balance.unwrap_or(U256::zero());
+                        beneficiary_account.balance = Some(current_balance + self_balance);
+                    }
+                }
+
+                return EvmResult { stack, success: true, logs, ret: Vec::new() };
             }
 
             _ => return EvmResult {stack, success: false, logs: logs, ret: Vec::new() },
